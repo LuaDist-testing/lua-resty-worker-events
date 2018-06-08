@@ -8,10 +8,12 @@ local debug_mode = ngx.config.debug
 local tostring = tostring
 local ipairs = ipairs
 local pcall = pcall
+local xpcall = xpcall
 local cjson = require("cjson.safe").new()
 local get_pid = ngx.worker.pid
 local now = ngx.now
 local sleep = ngx.sleep
+local traceback = debug.traceback
 
 -- event keys to shm
 local KEY_LAST_ID = "events-last"         -- ID of last event posted
@@ -30,6 +32,25 @@ local _wait_interval -- interval between tries when event data is unavailable
 
 local dump = function(...)
   ngx.log(ngx.DEBUG,"\027[31m", require("pl.pretty").write({...}),"\027[0m")
+end
+
+do
+  -- test whether xpcall is 5.2 compatible, and supports extra arguments
+  local xpcall_52 = xpcall(function(x)
+      assert(x == 1)
+    end, function() end, 1)
+
+  if not xpcall_52 then
+    -- No support for extra args, so need to wrap xpcall
+    local _xpcall = xpcall
+    local unpack = unpack or table.unpack
+    xpcall = function(f, eh, ...)
+      local args = { n = select("#", ...), ...}
+      return _xpcall(function()
+                       return f(unpack(args, 1, args.n))
+                     end, eh)
+    end
+  end
 end
 
 -- defaults
@@ -63,14 +84,14 @@ local autotable__index = function(self, key)
   return t
 end
 
---- Creates a new auto-table. 
+--- Creates a new auto-table.
 -- @param depth (optional, default 1) how deep to auto-generate tables. The last
 -- table in the chain generated will itself not be an auto-table. If `depth == 0` then
 -- there is no limit.
 -- @param mode (optional) set the weak table behavior
 -- @return new auto-table
 function autotable(depth)
-  
+
   local at = new_struct()
   setmetatable(at.subs, {
             __index = autotable__index,
@@ -83,7 +104,7 @@ end
 local _callbacks = autotable(2)
 -- strong/weak; array = global handlers called on every event
 -- strong/weak; hash  = subtables for a specific eventsource
--- eventsource-sub-table has the same structure, except the hash part contains 
+-- eventsource-sub-table has the same structure, except the hash part contains
 -- not 'eventsource', but 'event' specific handlers, no more sub tables
 
 
@@ -166,11 +187,18 @@ local function do_handlerlist(handler_list, source, event, data, pid)
         list[handler_list[count_key]] = nil
         handler_list[count_key] = handler_list[count_key] - 1
       else
-        success, err = pcall(handler, data, event, source, pid)
+        success, err = xpcall(handler, traceback, data, event, source, pid)
         if not success then
+          local d, e
+          if type(data) == "table" then
+            d, e = cjson.encode(data)
+            if not d then d = tostring(e) end
+          else
+            d = tostring(data)
+          end
           errlog("event callback failed; source=",source,
-                 ", event=",event,", pid=",pid, " error='", tostring(err),
-                 "', data="..cjson.encode(data))
+                 ", event=", event,", pid=",pid, " error='", tostring(err),
+                 "', data=", d)
         end
         i = i + 1
       end
@@ -281,10 +309,10 @@ _M.poll = function()
     -- so we cannot handle it here right now.
     return false
   end
-  
+
   local event_id, err = get_event_id()
-  if event_id == _last_event then 
-    return true 
+  if event_id == _last_event then
+    return true
   end
 
   if not event_id then
@@ -321,7 +349,7 @@ _M.poll = function()
           break
         end
         -- wait and retry
-        -- if the `sleep` function is unavailable in the current openresty 
+        -- if the `sleep` function is unavailable in the current openresty
         -- 'context' (eg. 'init_worker'), then the pcall fails. We're not
         -- checking the result, but will effectively be doing a busy-wait
         -- by looping until it hits the time-out, or the data is retrieved
@@ -389,8 +417,8 @@ local register = function(callback, mode, source, ...)
   else
     count_key = "strong_count"
     list_key = "strong_list"
-  end 
-    
+  end
+
   if not source then
     -- register as global event handler
     local list = _callbacks
@@ -448,7 +476,7 @@ end
 _M.unregister = function(callback, source, ...)
   assert(type(callback) == "function", "expected function, got: "..
          type(callback))
-       
+
   local success
   local count_key = "weak_count"
   local list_key = "weak_list"
@@ -497,7 +525,7 @@ _M.unregister = function(callback, source, ...)
     count_key = "strong_count"
     list_key = "strong_list"
   end
-  
+
   return (success == true)
 end
 
@@ -607,7 +635,7 @@ _M.configured = function()
 end
 
 -- Utility function to generate event lists and prevent typos in
--- magic strings. Accessing a non-existing event on the table will result in 
+-- magic strings. Accessing a non-existing event on the table will result in
 -- an unknown event error.
 -- @param source string with the event source name
 -- @param ... vararg, strings, with all events available

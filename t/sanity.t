@@ -9,7 +9,7 @@ use Cwd qw(cwd);
 
 #repeat_each(2);
 
-plan tests => repeat_each() * (blocks() * 6 - 1);
+plan tests => repeat_each() * (blocks() * 6 - 5);
 
 my $pwd = cwd();
 
@@ -514,12 +514,12 @@ init_worker_by_lua '
     ngx.cb_source  = function(...) return cb("source", ...) end
     ngx.cb_event12 = function(...) return cb("event12", ...) end
     ngx.cb_event3  = function(...) return cb("event3", ...) end
-    
+
     we.register(ngx.cb_global)
     we.register(ngx.cb_source,  "content_by_lua")
     we.register(ngx.cb_event12, "content_by_lua", "request1", "request2")
     we.register(ngx.cb_event3,  "content_by_lua", "request3")
-    
+
     local ok, err = we.configure{
         shm = "worker_events",
     }
@@ -641,16 +641,27 @@ init_worker_by_lua '
                 shm = "worker_events",
             }
             ngx.sleep(1)
-            
+
             local count = 0
-            
+
             local cb = {
-              global = function() count = count + 1 end,
-              source = function() count = count + 1 end,
-              event12 = function() count = count + 1 end,
-              event3 = function() count = count + 1 end,
+              global = function(source, event)
+                ngx.log(ngx.DEBUG, "global handler: ", source, ", ", event)
+                count = count + 1
+              end,
+              source = function(source, event)
+                ngx.log(ngx.DEBUG, "global source: ", source, ", ", event)
+                count = count + 1
+              end,
+              event12 = function(source, event)
+                ngx.log(ngx.DEBUG, "global event12: ", source, ", ", event)
+                count = count + 1
+              end,
+              event3 = function(source, event)
+                ngx.log(ngx.DEBUG, "global event3: ", source, ", ", event)
+                count = count + 1
+              end,
             }
-            setmetatable(cb, { __mode = "v" })
             we.register_weak(cb.global)
             we.register_weak(cb.source,  "content_by_lua")
             we.register_weak(cb.event12, "content_by_lua", "request1", "request2")
@@ -659,17 +670,17 @@ init_worker_by_lua '
             we.post("content_by_lua","request1","123")
             we.post("content_by_lua","request2","123")
             we.post("content_by_lua","request3","123")
-            assert(count == 9, "expected 9 calls")
+            ngx.say("before GC:", count)
 
             cb = nil
             collectgarbage()
             collectgarbage()
             count = 0
-            
+
             we.post("content_by_lua","request1","123")
             we.post("content_by_lua","request2","123")
             we.post("content_by_lua","request3","123")
-            ngx.say(count) -- 0
+            ngx.say("after GC:", count) -- 0
 
         ';
     }
@@ -677,6 +688,119 @@ init_worker_by_lua '
 --- request
 GET /t
 --- response_body
-0
+before GC:9
+after GC:0
 --- no_error_log
 --- timeout: 6
+
+
+
+=== TEST 9: callback error handling
+--- http_config eval
+"$::HttpConfig"
+. q{
+upstream foo.com {
+    server 127.0.0.1:12354;
+}
+
+server {
+    listen 12354;
+    location = /status {
+        return 200;
+    }
+}
+
+lua_shared_dict worker_events 1m;
+init_worker_by_lua '
+    ngx.shared.worker_events:flush_all()
+';
+}
+--- config
+    location = /t {
+        access_log off;
+        content_by_lua '
+            ngx.shared.worker_events:flush_all()
+            local we = require "resty.worker.events"
+            local ok, err = we.configure{
+                shm = "worker_events",
+            }
+            local error_func = function()
+              error("something went wrong here!")
+            end
+            local test_callback = function(source, event, data, pid)
+              error_func() -- nested call to check stack trace
+            end
+            we.register(test_callback)
+
+            -- non-serializable test data containing a function value
+            -- use "nil" as data, reproducing issue #5
+            we.post("content_by_lua","test_event", nil)
+
+            ngx.say("ok")
+        ';
+    }
+
+--- request
+GET /t
+--- response_body
+ok
+--- error_log
+something went wrong here!
+
+
+
+=== TEST 10: callback error stacktrace
+--- http_config eval
+"$::HttpConfig"
+. q{
+upstream foo.com {
+    server 127.0.0.1:12354;
+}
+
+server {
+    listen 12354;
+    location = /status {
+        return 200;
+    }
+}
+
+lua_shared_dict worker_events 1m;
+init_worker_by_lua '
+    ngx.shared.worker_events:flush_all()
+';
+}
+--- config
+    location = /t {
+        access_log off;
+        content_by_lua '
+            ngx.shared.worker_events:flush_all()
+            local we = require "resty.worker.events"
+            local ok, err = we.configure{
+                shm = "worker_events",
+            }
+
+            local error_func = function()
+              error("something went wrong here!")
+            end
+            local in_between = function()
+              error_func() -- nested call to check stack trace
+            end
+            local test_callback = function(source, event, data, pid)
+              in_between() -- nested call to check stack trace
+            end
+
+            we.register(test_callback)
+            we.post("content_by_lua","test_event")
+
+            ngx.say("ok")
+        ';
+    }
+
+--- request
+GET /t
+--- response_body
+ok
+--- error_log
+something went wrong here!
+in function 'error_func'
+in function 'in_between'
