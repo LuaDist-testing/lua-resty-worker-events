@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-resty-worker-events"
-version = "0.3.2-1"
+version = "0.3.3-1"
 -- LuaDist source
 source = {
-  tag = "0.3.2-1",
+  tag = "0.3.3-1",
   url = "git://github.com/LuaDist-testing/lua-resty-worker-events.git"
 }
 -- Original source
 -- source = {
---    url = "https://github.com/Kong/lua-resty-worker-events/archive/0.3.2.tar.gz",
---    dir = "lua-resty-worker-events-0.3.2"
+--    url = "https://github.com/Kong/lua-resty-worker-events/archive/0.3.3.tar.gz",
+--    dir = "lua-resty-worker-events-0.3.3"
 -- }
 description = {
    summary = "Cross worker eventbus for OpenResty",

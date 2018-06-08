@@ -1,10 +1,7 @@
 local log = ngx.log
 local ERR = ngx.ERR
-local INFO = ngx.INFO
-local WARN = ngx.WARN
 local DEBUG = ngx.DEBUG
 local new_timer = ngx.timer.at
-local debug_mode = ngx.config.debug
 local tostring = tostring
 local ipairs = ipairs
 local pcall = pcall
@@ -21,14 +18,14 @@ local KEY_DATA    = "events-data:"        -- serialized event json data
 local KEY_ONE     = "events-one:"         -- key for 'one' events check
 
 -- globals as upvalues (module is intended to run once per worker process)
-local _dict          -- the shared dictionary to use
-local _timeout       -- expire time for event data posted in shm (seconds)
-local _interval      -- polling interval (in seconds)
+local _dict           -- the shared dictionary to use
+local _unique_timeout -- expire time for unique data posted in shm (seconds)
+local _interval       -- polling interval (in seconds)
 local _pid = get_pid()
-local _last_event    -- event id of the last event handled
-local _wait_max      -- how long (in seconds) to wait when we have an event id,
-                     -- but no data, for the data to show up.
-local _wait_interval -- interval between tries when event data is unavailable
+local _last_event     -- event id of the last event handled
+local _wait_max       -- how long (in seconds) to wait when we have an event id,
+                      -- but no data, for the data to show up.
+local _wait_interval  -- interval between tries when event data is unavailable
 
 local dump = function(...)
   ngx.log(ngx.DEBUG,"\027[31m", require("pl.pretty").write({...}),"\027[0m")
@@ -54,7 +51,7 @@ do
 end
 
 -- defaults
-local DEFAULT_TIMEOUT = 2
+local DEFAULT_UNIQUE_TIMEOUT = 2
 local DEFAULT_INTERVAL = 1
 local DEFAULT_WAIT_MAX = 0.5
 local DEFAULT_WAIT_INTERVAL = 0.010
@@ -90,7 +87,7 @@ end
 -- there is no limit.
 -- @param mode (optional) set the weak table behavior
 -- @return new auto-table
-function autotable(depth)
+local function autotable(depth)
 
   local at = new_struct()
   setmetatable(at.subs, {
@@ -109,30 +106,9 @@ local _callbacks = autotable(2)
 
 
 local _M = {
-  _VERSION = '0.3.1',
+  _VERSION = '0.3.3',
 }
 
-local function info(...)
-  log(INFO, "worker-events: ", ...)
-end
-
-local function warn(...)
-  log(WARN, "worker-events: ", ...)
-end
-
-local function errlog(...)
-  log(ERR, "worker-events: ", ...)
-end
-
-local debug = function() end
-if debug_mode then
-  debug = function(...)
-    -- print("debug mode: ", debug_mode)
-    if debug_mode then
-      log(DEBUG, "worker-events: ", ...)
-    end
-  end
-end
 
 -- gets current event id
 -- @return event_id
@@ -163,7 +139,7 @@ local function post_event(source, event, data, unique)
   event_id, err = _dict:incr(KEY_LAST_ID, 1)
   if err then return event_id, err end
 
-  success, err = _dict:add(KEY_DATA..tostring(event_id), json, _timeout)
+  success, err = _dict:add(KEY_DATA..tostring(event_id), json)
   if not success then return success, err end
 
   return event_id
@@ -196,7 +172,7 @@ local function do_handlerlist(handler_list, source, event, data, pid)
           else
             d = tostring(data)
           end
-          errlog("event callback failed; source=",source,
+          log(ERR, "worker-events: event callback failed; source=",source,
                  ", event=", event,", pid=",pid, " error='", tostring(err),
                  "', data=", d)
         end
@@ -213,7 +189,7 @@ end
 
 
 local function do_event(source, event, data, pid)
-  debug("handling event; source=",source,
+  log(DEBUG, "worker-events: handling event; source=",source,
          ", event=",event,", pid=",pid,", data=",tostring(data))
 
   local list = _callbacks
@@ -228,15 +204,16 @@ end
 -- for 'one' events, returns `true` when this worker is supposed to handle it
 local function mine_to_have(id, unique)
   local key = KEY_ONE .. tostring(unique)
-  local success, err = _dict:add(key, _pid, _timeout)
+  local success, err = _dict:add(key, _pid, _unique_timeout)
 
   if success then return true end
 
   if err == "exists"  then
-    debug("skipping event ",id," was handled by worker ",
+    log(DEBUG, "worker-events: skipping event ",id," was handled by worker ",
           _dict:get(key))
   else
-    errlog("cannot determine who handles event ",id,", dropping it: ",err)
+    log(ERR, "worker-events: cannot determine who handles event ", id,
+             ", dropping it: ", err)
   end
 end
 
@@ -245,7 +222,7 @@ local function do_event_json(id, json)
   local d, err
   d, err = cjson.decode(json)
   if not d then
-    return errlog("failed decoding json event data: ", err)
+    return log(ERR, "worker-events: failed decoding json event data: ", err)
   end
 
   if d.unique and not mine_to_have(id, d.unique) then return end
@@ -274,7 +251,7 @@ _M.post = function(source, event, data, unique)
   if not success then
     err = 'failed posting event "'..event..'" by "'..
           source..'"; '..tostring(err)
-    errlog(err)
+    log(ERR, "worker-events: ", err)
     return success, err
   end
 
@@ -316,8 +293,8 @@ _M.poll = function()
   end
 
   if not event_id then
-    local err = "failed to get current event id: "..tostring(err)
-    errlog(err)
+    local err = "failed to get current event id: " .. tostring(err)
+    log(ERR, "worker-events: ", err)
     return nil, err
   end
 
@@ -341,7 +318,7 @@ _M.poll = function()
     local err = cache_err[idx]
     while not data do
       if err then
-        errlog("Error fetching event data: ", err)
+        log(ERR, "worker-events: error fetching event data: ", err)
         break
       else
         -- just nil, so must wait for data to appear
@@ -362,18 +339,11 @@ _M.poll = function()
 
     if data then
       _busy_polling = true -- need to flag to make sure the eventhandlers do not re-enter
-      local xtime = now()
       do_event_json(_last_event - count + idx, data)
-      local duration = now()-xtime
       _busy_polling = nil
-      if duration>_timeout then
-        warn("processing event ",tostring(_last_event - count + idx),
-             " took "..duration.." seconds, longer than the 'timeout' value "..
-             "for retaining event data, events might be dropped.")
-      end
     else
-      errlog("dropping event; waiting for event data timed out, id: ",
-           _last_event - count + idx)
+      log(ERR, "worker-events: dropping event; waiting for event data ",
+           "timed out, id: ", _last_event - count + idx)
     end
   end
 
@@ -398,7 +368,7 @@ do_timer = function(premature)
         _M.post(_M.events._source, _M.events.stopping)
       end
       err = "failed to create timer: " .. tostring(err)
-      errlog(err)
+      log(ERR, "worker-events: ", err)
       return nil, err
     end
   end
@@ -546,7 +516,7 @@ _M.configure = function(opts)
     _pid = get_pid()
     --_dict = nil     -- this value can actually stay, because its shared
     _interval = nil
-    _timeout = nil
+    _unique_timeout = nil
     _callbacks = nil
     _wait_max = nil
     _wait_interval = nil
@@ -566,11 +536,11 @@ _M.configure = function(opts)
     return nil, 'shm "' .. tostring(shm) .. '" not found'
   end
 
-  local timeout = opts.timeout or (_timeout or DEFAULT_TIMEOUT)
-  if type(timeout) ~= "number" and timeout ~= nil then
+  local unique_timeout = opts.timeout or (_unique_timeout or DEFAULT_UNIQUE_TIMEOUT)
+  if type(unique_timeout) ~= "number" and unique_timeout ~= nil then
     return nil, 'optional "timeout" option must be a number'
   end
-  if timeout <= 0 then
+  if unique_timeout <= 0 then
     return nil, '"timeout" must be greater than 0'
   end
 
@@ -602,7 +572,7 @@ _M.configure = function(opts)
   local old_interval = _interval
   _interval = interval
   _dict = dict
-  _timeout = timeout
+  _unique_timeout = unique_timeout
   _wait_interval = wait_interval
   _wait_max = wait_max
   _last_event = _last_event or get_event_id()

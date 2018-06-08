@@ -1,7 +1,7 @@
-Name
-====
+lua-resty-worker-events
+=======================
 
-lua-resty-worker-events - Inter process events for Nginx worker processes
+Inter process events for Nginx worker processes
 
 Table of Contents
 =================
@@ -57,7 +57,7 @@ http {
 
         local ok, err = ev.configure {
             shm = "process_events", -- defined by "lua_shared_dict"
-            timeout = 2,            -- life time of event data in shm
+            timeout = 2,            -- life time of unique event data in shm
             interval = 1,           -- poll interval (seconds)
 
             wait_interval = 0.010,  -- wait before retry fetching event data
@@ -140,13 +140,16 @@ configure
 
 Will initialize the event listener. The `opts` parameter is a Lua table with named options
 
-* `shm`: (required) name of the shared memory to use
-* `timeout`: (optional) timeout of event data stored in shm (in seconds), default 2
+* `shm`: (required) name of the shared memory to use. Event data will not expire, so
+  the module relies on the shm lru mechanism to evict old events from the shm. As such
+  the shm should probably not be used for other purposes.
 * `interval`: (optional) interval to poll for events (in seconds), default 1
 * `wait_interval`: (optional) interval between two tries when a new eventid is found, but the
   data is not available yet (due to asynchronous behaviour of the worker processes)
 * `wait_max`: (optional) max time to wait for data when event id is found, before discarding
   the event. This is a fail-safe setting in case something went wrong.
+* `timeout`: (optional) timeout of unique event data stored in shm (in seconds), default 2.
+  See the `unique` parameter of the [post](#post) method.
 
 The return value will be `true`, or `nil` and an error message.
 
@@ -391,6 +394,12 @@ All rights reserved.
 
 History
 =======
+
+Note: please update version number in the code when releasing a new version!
+
+0.3.3, 8-May-2018
+
+- fix: timeouts in init phases, by removing timeout setting, see issue #9
 
 0.3.2, 11-Apr-2018
 
